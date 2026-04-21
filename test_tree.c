@@ -1,253 +1,109 @@
-// tree.c — Tree object serialization and construction
+// test_tree.c — Phase 2 test program
 //
-// PROVIDED functions: get_file_mode, tree_parse, tree_serialize
-// TODO functions:     tree_from_index
-//
-// Binary tree format (per entry, concatenated with no separators):
-//   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
-//
-// Example single entry (conceptual):
-//   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
+// Compile and run:
+//   make test_tree
+//   ./test_tree
 
+#include "pes.h"
 #include "tree.h"
-#include "index.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
+#include <assert.h>
+#include <stdlib.h>
 
-#ifdef _WIN32
-#define lstat stat
-#endif
+void test_tree_roundtrip(void) {
+    // Build a tree manually
+    Tree original;
+    original.count = 3;
 
-// ─── Mode Constants ─────────────────────────────────────────────────────────
+    original.entries[0].mode = 0100644;
+    memset(original.entries[0].hash.hash, 0xAA, HASH_SIZE);
+    strcpy(original.entries[0].name, "README.md");
 
-#define MODE_FILE      0100644
-#define MODE_EXEC      0100755
-#define MODE_DIR       0040000
+    original.entries[1].mode = 0040000;
+    memset(original.entries[1].hash.hash, 0xBB, HASH_SIZE);
+    strcpy(original.entries[1].name, "src");
 
-// Forward declaration from object store module.
-int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+    original.entries[2].mode = 0100755;
+    memset(original.entries[2].hash.hash, 0xCC, HASH_SIZE);
+    strcpy(original.entries[2].name, "build.sh");
 
-typedef struct PathNode {
-    char name[256];
-    int is_file;
-    uint32_t mode;
-    ObjectID hash;
-    struct PathNode *children;
-    struct PathNode *next;
-} PathNode;
+    // Serialize
+    void *data;
+    size_t len;
+    int rc = tree_serialize(&original, &data, &len);
+    assert(rc == 0);
+    assert(data != NULL);
+    assert(len > 0);
+    printf("Serialized tree: %zu bytes\n", len);
 
-static PathNode *node_find_child(PathNode *parent, const char *name) {
-    for (PathNode *n = parent->children; n; n = n->next) {
-        if (strcmp(n->name, name) == 0) return n;
-    }
-    return NULL;
+    // Parse back
+    Tree parsed;
+    rc = tree_parse(data, len, &parsed);
+    assert(rc == 0);
+    assert(parsed.count == 3);
+
+    // Verify entries are sorted by name (tree_serialize must sort)
+    assert(strcmp(parsed.entries[0].name, "README.md") == 0);
+    assert(strcmp(parsed.entries[1].name, "build.sh") == 0);
+    assert(strcmp(parsed.entries[2].name, "src") == 0);
+
+    // Verify modes preserved
+    assert(parsed.entries[0].mode == 0100644);
+    assert(parsed.entries[1].mode == 0100755);
+    assert(parsed.entries[2].mode == 0040000);
+
+    // Verify hashes preserved
+    assert(memcmp(parsed.entries[0].hash.hash, original.entries[0].hash.hash, HASH_SIZE) == 0);
+
+    free(data);
+
+    printf("PASS: tree serialize/parse roundtrip\n");
 }
 
-static PathNode *node_get_or_create_child(PathNode *parent, const char *name, int is_file) {
-    PathNode *existing = node_find_child(parent, name);
-    if (existing) return existing;
+void test_tree_determinism(void) {
+    // Same entries in different order must produce identical serialization
+    Tree tree_a, tree_b;
+    tree_a.count = 2;
+    tree_b.count = 2;
 
-    PathNode *n = calloc(1, sizeof(PathNode));
-    if (!n) return NULL;
-    strncpy(n->name, name, sizeof(n->name) - 1);
-    n->is_file = is_file;
-    n->next = parent->children;
-    parent->children = n;
-    return n;
+    // tree_a: entries in order z, a
+    tree_a.entries[0].mode = 0100644;
+    memset(tree_a.entries[0].hash.hash, 0x11, HASH_SIZE);
+    strcpy(tree_a.entries[0].name, "z_file.txt");
+    tree_a.entries[1].mode = 0100644;
+    memset(tree_a.entries[1].hash.hash, 0x22, HASH_SIZE);
+    strcpy(tree_a.entries[1].name, "a_file.txt");
+
+    // tree_b: entries in order a, z
+    tree_b.entries[0].mode = 0100644;
+    memset(tree_b.entries[0].hash.hash, 0x22, HASH_SIZE);
+    strcpy(tree_b.entries[0].name, "a_file.txt");
+    tree_b.entries[1].mode = 0100644;
+    memset(tree_b.entries[1].hash.hash, 0x11, HASH_SIZE);
+    strcpy(tree_b.entries[1].name, "z_file.txt");
+
+    void *data_a, *data_b;
+    size_t len_a, len_b;
+    tree_serialize(&tree_a, &data_a, &len_a);
+    tree_serialize(&tree_b, &data_b, &len_b);
+
+    assert(len_a == len_b);
+    assert(memcmp(data_a, data_b, len_a) == 0);
+
+    free(data_a);
+    free(data_b);
+
+    printf("PASS: tree deterministic serialization\n");
 }
 
-static void node_free(PathNode *node) {
-    while (node) {
-        PathNode *next = node->next;
-        node_free(node->children);
-        free(node);
-        node = next;
-    }
-}
+int main(void) {
+    system("rm -rf .pes");
+    system("mkdir -p .pes/objects .pes/refs/heads");
 
-static int write_dir_node(PathNode *dir, ObjectID *id_out) {
-    Tree t;
-    t.count = 0;
+    test_tree_roundtrip();
+    test_tree_determinism();
 
-    for (PathNode *n = dir->children; n; n = n->next) {
-        if (t.count >= MAX_TREE_ENTRIES) return -1;
-
-        TreeEntry *e = &t.entries[t.count++];
-        snprintf(e->name, sizeof(e->name), "%s", n->name);
-
-        if (n->is_file) {
-            e->mode = n->mode;
-            e->hash = n->hash;
-        } else {
-            e->mode = MODE_DIR;
-            if (write_dir_node(n, &e->hash) != 0) return -1;
-        }
-    }
-
-    void *raw = NULL;
-    size_t raw_len = 0;
-    if (tree_serialize(&t, &raw, &raw_len) != 0) return -1;
-
-    int rc = object_write(OBJ_TREE, raw, raw_len, id_out);
-    free(raw);
-    return rc;
-}
-
-// ─── PROVIDED ───────────────────────────────────────────────────────────────
-
-// Determine the object mode for a filesystem path.
-uint32_t get_file_mode(const char *path) {
-    struct stat st;
-    if (lstat(path, &st) != 0) return 0;
-
-    if (S_ISDIR(st.st_mode))  return MODE_DIR;
-    if (st.st_mode & S_IXUSR) return MODE_EXEC;
-    return MODE_FILE;
-}
-
-// Parse binary tree data into a Tree struct safely.
-// Returns 0 on success, -1 on parse error.
-int tree_parse(const void *data, size_t len, Tree *tree_out) {
-    tree_out->count = 0;
-    const uint8_t *ptr = (const uint8_t *)data;
-    const uint8_t *end = ptr + len;
-
-    while (ptr < end && tree_out->count < MAX_TREE_ENTRIES) {
-        TreeEntry *entry = &tree_out->entries[tree_out->count];
-
-        // 1. Safely find the space character for the mode
-        const uint8_t *space = memchr(ptr, ' ', end - ptr);
-        if (!space) return -1; // Malformed data
-
-        // Parse mode into an isolated buffer
-        char mode_str[16] = {0};
-        size_t mode_len = space - ptr;
-        if (mode_len >= sizeof(mode_str)) return -1;
-        memcpy(mode_str, ptr, mode_len);
-        entry->mode = strtol(mode_str, NULL, 8);
-
-        ptr = space + 1; // Skip space
-
-        // 2. Safely find the null terminator for the name
-        const uint8_t *null_byte = memchr(ptr, '\0', end - ptr);
-        if (!null_byte) return -1; // Malformed data
-
-        size_t name_len = null_byte - ptr;
-        if (name_len >= sizeof(entry->name)) return -1;
-        memcpy(entry->name, ptr, name_len);
-        entry->name[name_len] = '\0'; // Ensure null-terminated
-
-        ptr = null_byte + 1; // Skip null byte
-
-        // 3. Read the 32-byte binary hash
-        if (ptr + HASH_SIZE > end) return -1; 
-        memcpy(entry->hash.hash, ptr, HASH_SIZE);
-        ptr += HASH_SIZE;
-
-        tree_out->count++;
-    }
+    printf("\nAll Phase 2 tests passed.\n");
     return 0;
-}
-
-// Helper for qsort to ensure consistent tree hashing
-static int compare_tree_entries(const void *a, const void *b) {
-    return strcmp(((const TreeEntry *)a)->name, ((const TreeEntry *)b)->name);
-}
-
-// Serialize a Tree struct into binary format for storage.
-// Caller must free(*data_out).
-// Returns 0 on success, -1 on error.
-int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
-    // Estimate max size: (6 bytes mode + 1 byte space + 256 bytes name + 1 byte null + 32 bytes hash) per entry
-    size_t max_size = tree->count * 296; 
-    uint8_t *buffer = malloc(max_size);
-    if (!buffer) return -1;
-
-    // Create a mutable copy to sort entries (Git requirement)
-    Tree sorted_tree = *tree;
-    qsort(sorted_tree.entries, sorted_tree.count, sizeof(TreeEntry), compare_tree_entries);
-
-    size_t offset = 0;
-    for (int i = 0; i < sorted_tree.count; i++) {
-        const TreeEntry *entry = &sorted_tree.entries[i];
-        
-        // Write mode and name (%o writes octal correctly for Git standards)
-        int written = sprintf((char *)buffer + offset, "%o %s", entry->mode, entry->name);
-        offset += written + 1; // +1 to step over the null terminator written by sprintf
-        
-        // Write binary hash
-        memcpy(buffer + offset, entry->hash.hash, HASH_SIZE);
-        offset += HASH_SIZE;
-    }
-
-    *data_out = buffer;
-    *len_out = offset;
-    return 0;
-}
-
-// ─── TODO: Implement these ──────────────────────────────────────────────────
-
-// Build a tree hierarchy from the current index and write all tree
-// objects to the object store.
-//
-// HINTS - Useful functions and concepts for this phase:
-//   - index_load      : load the staged files into memory
-//   - strchr          : find the first '/' in a path to separate directories from files
-//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
-//   - Recursion       : you will likely want to create a recursive helper function 
-//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
-//   - tree_serialize  : convert your populated Tree struct into a binary buffer
-//   - object_write    : save that binary buffer to the store as OBJ_TREE
-//
-// Returns 0 on success, -1 on error.
-int tree_from_index(ObjectID *id_out) {
-    Index *index = malloc(sizeof(Index));
-    if (!index) return -1;
-    if (index_load(index) != 0) {
-        free(index);
-        return -1;
-    }
-
-    PathNode root = {0};
-
-    for (int i = 0; i < index->count; i++) {
-        const IndexEntry *ie = &index->entries[i];
-
-        char path_copy[sizeof(ie->path)];
-        strncpy(path_copy, ie->path, sizeof(path_copy) - 1);
-        path_copy[sizeof(path_copy) - 1] = '\0';
-
-        PathNode *cur = &root;
-        char *saveptr = NULL;
-        char *part = strtok_r(path_copy, "/", &saveptr);
-
-        while (part) {
-            char *next = strtok_r(NULL, "/", &saveptr);
-            int is_file = (next == NULL);
-
-            PathNode *child = node_get_or_create_child(cur, part, is_file);
-            if (!child) {
-                node_free(root.children);
-                free(index);
-                return -1;
-            }
-
-            if (is_file) {
-                child->is_file = 1;
-                child->mode = ie->mode;
-                child->hash = ie->hash;
-            }
-
-            cur = child;
-            part = next;
-        }
-    }
-
-    int rc = write_dir_node(&root, id_out);
-    node_free(root.children);
-    free(index);
-    return rc;
 }
