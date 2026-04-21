@@ -647,34 +647,34 @@ The following questions cover filesystem concepts beyond the implementation scop
 ### Screenshots
 
 #### 1A - test_objects passing
-![1A](images/1A.png)
+![1A](images/images/1A.png)
 
 #### 1B - object sharding layout
-![1B](images/1B.png)
+![1B](images/images/1B.png)
 
 #### 2A - test_tree passing
-![2A](images/2A.png)
+![2A](images/images/2A.png)
 
 #### 2B - raw tree object bytes
-![2B](images/2B.png)
+![2B](images/images/2B.png)
 
 #### 3A - init add status flow
-![3A](images/3A.png)
+![3A](images/images/3A.png)
 
 #### 3B - text index file
-![3B](images/3B.png)
+![3B](images/images/3B.png)
 
 #### 4A - commit log output
-![4A](images/4A.png)
+![4A](images/images/4A.png)
 
 #### 4B - object store growth
-![4B](images/4B.png)
+![4B](images/images/4B.png)
 
 #### 4C - HEAD and main ref chain
-![4C](images/4C.png)
+![4C](images/images/4C.png)
 
 #### Final - integration run
-![Final](images/5.png)
+![Final](images/images/5.png)
 
 ### Phase 5 and 6 Written Answers
 
