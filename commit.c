@@ -25,6 +25,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#ifdef _WIN32
+#include <io.h>
+#define fsync _commit
+#endif
+
 // Forward declarations (implemented in object.c)
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
@@ -61,13 +66,13 @@ int commit_parse(const void *data, size_t len, Commit *commit_out) {
     if (!last_space) return -1;
     ts = (uint64_t)strtoull(last_space + 1, NULL, 10);
     *last_space = '\0';
-    snprintf(commit_out->author, sizeof(commit_out->author), "%s", author_buf);
+    strncpy(commit_out->author, author_buf, sizeof(commit_out->author) - 1);
     commit_out->timestamp = ts;
     p = strchr(p, '\n') + 1;  // skip author line
     p = strchr(p, '\n') + 1;  // skip committer line
     p = strchr(p, '\n') + 1;  // skip blank line
 
-    snprintf(commit_out->message, sizeof(commit_out->message), "%s", p);
+    strncpy(commit_out->message, p, sizeof(commit_out->message) - 1);
     return 0;
 }
 
@@ -112,8 +117,17 @@ int commit_walk(commit_walk_fn callback, void *ctx) {
         size_t raw_len;
         if (object_read(&id, &type, &raw, &raw_len) != 0) return -1;
 
+        char *text = malloc(raw_len + 1);
+        if (!text) {
+            free(raw);
+            return -1;
+        }
+        memcpy(text, raw, raw_len);
+        text[raw_len] = '\0';
+
         Commit c;
-        int rc = commit_parse(raw, raw_len, &c);
+        int rc = commit_parse(text, raw_len, &c);
+        free(text);
         free(raw);
         if (rc != 0) return -1;
 
@@ -155,14 +169,14 @@ int head_update(const ObjectID *new_commit) {
     fclose(f);
     line[strcspn(line, "\r\n")] = '\0';
 
-    char target_path[520];
+    char target_path[512];
     if (strncmp(line, "ref: ", 5) == 0) {
         snprintf(target_path, sizeof(target_path), "%s/%s", PES_DIR, line + 5);
     } else {
         snprintf(target_path, sizeof(target_path), "%s", HEAD_FILE); // Detached HEAD
     }
 
-    char tmp_path[528];
+    char tmp_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target_path);
     
     f = fopen(tmp_path, "w");
@@ -175,7 +189,10 @@ int head_update(const ObjectID *new_commit) {
     fflush(f);
     fsync(fileno(f));
     fclose(f);
-    
+
+#ifdef _WIN32
+    remove(target_path);
+#endif
     return rename(tmp_path, target_path);
 }
 
@@ -194,8 +211,33 @@ int head_update(const ObjectID *new_commit) {
 //
 // Returns 0 on success, -1 on error.
 int commit_create(const char *message, ObjectID *commit_id_out) {
-    // TODO: Implement commit creation
-    // (See Lab Appendix for logical steps)
-    (void)message; (void)commit_id_out;
-    return -1;
+    if (!message || !commit_id_out || message[0] == '\0') return -1;
+
+    Commit c;
+    memset(&c, 0, sizeof(c));
+
+    if (tree_from_index(&c.tree) != 0) return -1;
+
+    if (head_read(&c.parent) == 0) {
+        c.has_parent = 1;
+    } else {
+        c.has_parent = 0;
+    }
+
+    snprintf(c.author, sizeof(c.author), "%s", pes_author());
+    c.timestamp = (uint64_t)time(NULL);
+    snprintf(c.message, sizeof(c.message), "%s", message);
+
+    void *raw = NULL;
+    size_t raw_len = 0;
+    if (commit_serialize(&c, &raw, &raw_len) != 0) return -1;
+
+    if (object_write(OBJ_COMMIT, raw, raw_len, commit_id_out) != 0) {
+        free(raw);
+        return -1;
+    }
+    free(raw);
+
+    if (head_update(commit_id_out) != 0) return -1;
+    return 0;
 }
